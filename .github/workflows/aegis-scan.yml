@@ -1,0 +1,142 @@
+# Aegis security scan: a reusable workflow customers call from their own repository.
+# It runs pinned, checksum-verified scanners on the checked-out commit and uploads redacted SARIF
+# to Aegis, authenticated by the job's GitHub OIDC token (no stored secret).
+# Published from Nextrium/aegis-review; changes are made there and copied here.
+# Caller example and setup: https://github.com/Nextrium/aegis-scan#readme
+name: Aegis security scan
+
+on:
+  workflow_call:
+    inputs:
+      aegis-url:
+        description: Aegis base URL
+        type: string
+        default: https://aegis.nextrium.org
+      oidc-audience:
+        description: Audience for the OIDC token; must match AEGIS_OIDC_AUDIENCE on the worker
+        type: string
+        default: aegis.nextrium.org
+      extra-rules:
+        description: Optional path, in the caller's repository, to extra Opengrep rules
+        type: string
+        default: ""
+
+permissions: {}
+
+jobs:
+  scan:
+    name: Scan and upload to Aegis
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AEGIS_URL: ${{ inputs.aegis-url }}
+      AEGIS_AUDIENCE: ${{ inputs.oidc-audience }}
+      EXTRA_RULES: ${{ inputs.extra-rules }}
+      TOOLS_DIR: ${{ runner.temp }}/aegis
+    steps:
+      - name: Check out the commit under scan
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Install pinned scanners (checksums verified)
+        run: |
+          set -euo pipefail
+          mkdir -p "$TOOLS_DIR/bin" "$TOOLS_DIR/dl"
+          cd "$TOOLS_DIR/dl"
+          fetch() {
+            curl -fsSL --retry 3 -o "$2" "$1"
+            echo "$3  $2" | sha256sum -c --quiet -
+          }
+          fetch https://github.com/opengrep/opengrep/releases/download/v1.30.2/opengrep_manylinux_x86 \
+            opengrep a66aa3278457f02b287b985a45b6762aebcaba5000f2689245fd1ed86d1456c7
+          fetch https://github.com/google/osv-scanner/releases/download/v2.7.0/osv-scanner_linux_amd64 \
+            osv-scanner 160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b
+          fetch https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+            gitleaks.tar.gz 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+          fetch https://github.com/zizmorcore/zizmor/releases/download/v1.31.1/zizmor-x86_64-unknown-linux-gnu.tar.gz \
+            zizmor.tar.gz d185f726bdaf92df78273217dfdd24ebcd6b0ef48cf3ce776ff5762b6e138c99
+          install -m 0755 opengrep "$TOOLS_DIR/bin/opengrep"
+          install -m 0755 osv-scanner "$TOOLS_DIR/bin/osv-scanner"
+          mkdir gitleaks zizmor
+          tar -xzf gitleaks.tar.gz -C gitleaks
+          tar -xzf zizmor.tar.gz -C zizmor
+          install -m 0755 "$(find gitleaks -type f -name gitleaks | head -1)" "$TOOLS_DIR/bin/gitleaks"
+          install -m 0755 "$(find zizmor -type f -name zizmor | head -1)" "$TOOLS_DIR/bin/zizmor"
+          echo "$TOOLS_DIR/bin" >> "$GITHUB_PATH"
+
+      - name: Fetch the Aegis rule pack
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -D "$TOOLS_DIR/rules.headers" -o "$TOOLS_DIR/rules.yml" "$AEGIS_URL/scanner/rules.yml"
+          grep -i '^x-aegis-rules-version' "$TOOLS_DIR/rules.headers" || true
+
+      - name: Run scanners
+        run: |
+          set -uo pipefail
+          out="$TOOLS_DIR/sarif"
+          mkdir -p "$out"
+          : > "$TOOLS_DIR/tool-errors.txt"
+          note() { echo "$1" | tee -a "$TOOLS_DIR/tool-errors.txt"; }
+
+          rules=(-f "$TOOLS_DIR/rules.yml")
+          if [ -n "$EXTRA_RULES" ]; then rules+=(-f "$EXTRA_RULES"); fi
+          opengrep scan "${rules[@]}" --sarif-output="$out/opengrep.sarif" --quiet . \
+            || note "opengrep exited with code $?"
+
+          # osv-scanner: 0 = clean, 1 = vulnerabilities found, 128 = no package manifests to scan.
+          osv-scanner scan source -r --format sarif --output-file "$out/osv-scanner.sarif" .
+          rc=$?
+          if [ "$rc" -eq 128 ]; then rm -f "$out/osv-scanner.sarif"; elif [ "$rc" -gt 1 ]; then note "osv-scanner exited with code $rc"; fi
+
+          gitleaks dir . --report-format sarif --report-path "$out/gitleaks.sarif" --redact --exit-code 0 --no-banner \
+            || note "gitleaks exited with code $?"
+
+          if [ -d .github/workflows ]; then
+            zizmor --offline --format sarif . > "$out/zizmor.sarif" || note "zizmor exited with code $?"
+          fi
+          ls -la "$out"
+
+      - name: Upload results to Aegis
+        run: |
+          set -euo pipefail
+          token=$(curl -fsSL -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AEGIS_AUDIENCE" | python3 -c 'import json,sys; print(json.load(sys.stdin)["value"])')
+          python3 - "$TOOLS_DIR" "$GITHUB_WORKSPACE" > "$TOOLS_DIR/upload.json" <<'PY'
+          import json, os, sys
+          tools_dir, workspace = sys.argv[1], sys.argv[2]
+          sarif_dir = os.path.join(tools_dir, "sarif")
+          runs, errors = [], []
+          for name in sorted(os.listdir(sarif_dir)):
+              path = os.path.join(sarif_dir, name)
+              try:
+                  with open(path, encoding="utf-8") as fh:
+                      runs.extend(json.load(fh).get("runs", []))
+              except Exception as exc:  # a tool that wrote broken SARIF is reported, not fatal
+                  errors.append(f"{name}: unreadable SARIF ({exc.__class__.__name__})")
+          with open(os.path.join(tools_dir, "tool-errors.txt"), encoding="utf-8") as fh:
+              errors.extend(line.strip() for line in fh if line.strip())
+          # Strip code snippets before anything leaves the runner.
+          for run in runs:
+              for result in run.get("results", []) or []:
+                  for loc in result.get("locations", []) or []:
+                      region = loc.get("physicalLocation", {}).get("region")
+                      if isinstance(region, dict):
+                          region.pop("snippet", None)
+                      context = loc.get("physicalLocation", {}).get("contextRegion")
+                      if isinstance(context, dict):
+                          context.pop("snippet", None)
+          body = {"stripPrefixes": [workspace], "toolErrors": errors}
+          if runs:
+              body["sarif"] = {"version": "2.1.0", "runs": runs}
+          json.dump(body, sys.stdout)
+          PY
+          status=$(curl -sS -o "$TOOLS_DIR/response.json" -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $token" -H "Content-Type: application/json" \
+            --data-binary "@$TOOLS_DIR/upload.json" "$AEGIS_URL/api/scanner-results/github-actions")
+          cat "$TOOLS_DIR/response.json"; echo
+          if [ "$status" != "201" ]; then echo "::error::Aegis rejected the upload (HTTP $status)"; exit 1; fi
