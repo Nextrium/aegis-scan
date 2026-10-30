@@ -35,8 +35,11 @@ jobs:
       AEGIS_URL: ${{ inputs.aegis-url }}
       AEGIS_AUDIENCE: ${{ inputs.oidc-audience }}
       EXTRA_RULES: ${{ inputs.extra-rules }}
-      TOOLS_DIR: ${{ runner.temp }}/aegis
     steps:
+      # The runner context is not available in job-level env, so the tools directory is set here.
+      - name: Prepare
+        run: echo "TOOLS_DIR=$RUNNER_TEMP/aegis" >> "$GITHUB_ENV"
+
       - name: Check out the commit under scan
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
