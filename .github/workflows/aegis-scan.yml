@@ -80,7 +80,9 @@ jobs:
 
       - name: Run scanners
         run: |
-          set -uo pipefail
+          # Actions runs steps with -e; scanners exit non-zero when they find something, so
+          # each exit code is checked by hand below instead.
+          set +e -uo pipefail
           out="$TOOLS_DIR/sarif"
           mkdir -p "$out"
           : > "$TOOLS_DIR/tool-errors.txt"
